@@ -21,7 +21,7 @@ dependencies = [
 
 
 [project.scripts]
-aikta = "aikta:cli_main"
+aikta = "aikta:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aikta/"]
