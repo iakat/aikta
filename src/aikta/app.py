@@ -8,89 +8,99 @@ import aiohttp
 import os
 from pathlib import Path
 
-
 class Server(BaseServer):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.storage = Storage(db=Path(DATA_DIR) / "aikta.db")
         self.lastfm = LastFM(LASTFM_API_KEY, self.storage)
-        self.extra_command = os.getenv("EXTRA_COMMAND", "").lower()
-        self.extra_api = os.getenv("EXTRA_API", "")
-        self.extra_transform = os.getenv("EXTRA_TRANSFORM", "")
-
+        
+        # Parse multiple extra commands
+        self.extra_commands = {}
+        extra_config = os.getenv("EXTRA_COMMANDS", "")
+        if extra_config:
+            for command_spec in extra_config.split(";"):
+                parts = command_spec.split(",")
+                if len(parts) >= 2:
+                    cmd = parts[0].strip().lower()
+                    api = parts[1].strip()
+                    transform = parts[2].strip() if len(parts) > 2 else ""
+                    self.extra_commands[cmd] = {"api": api, "transform": transform}
+    
     async def line_read(self, line: Line):
         print(f"{self.name} < {line.format()}")
-
         match line.command:
             case "001":
                 print(f"connected to {self.isupport.network}")
                 for channel in CHANNELS:
                     await self.send(build("JOIN", [channel]))
-
             case "PRIVMSG":
                 target, msg = line.params[:2]
                 nick = line.source.split("!")[0]
-
                 cmd = msg.split()[0].lower()
+                
                 match cmd:
                     case ".np": await self._handle_np(target, nick, msg)
                     case ".wp": await self._handle_wp(target)
                     case ".v": await self._handle_version(target)
-                    case _ if self.extra_command and cmd == f".{self.extra_command}":
-                        await self._handle_extra(target)
-
+                    case _ if cmd in self.extra_commands:
+                        await self._handle_extra(target, cmd)
+    
     async def _handle_np(self, target, nick, msg):
         args = msg.split()[1:]
         lfm_user = args[0] if args else await self.storage.read(f"lastfm:{nick}")
-
         if args:
             await self.storage.write(f"lastfm:{nick}", lfm_user)
-
         if not lfm_user:
             return await self.send(build("PRIVMSG", [target, f"{nick}: set your lastfm: .np username"]))
-
         data = await self.lastfm.get_now_playing(lfm=lfm_user, nick=nick)
         resp = data["formatted"] if data and data["song"]["artist"] else f"{nick}: No recent track found."
         await self.send(build("PRIVMSG", [target, resp]))
-
+    
     async def _handle_wp(self, target):
         if not (channel := self.channels.get(target)):
             return
-
         users = [{"id": n, "display_name": n} for n in channel.users]
         results = await self.lastfm.now_playing_for_users(users)
-
         for result in results or ["..."]:
             await self.send(build("PRIVMSG", [target, result]))
             await asyncio.sleep(1.0)
-
+    
     async def _handle_version(self, target):
         version_file = Path("/app/.venv/.git_commit")
         version = version_file.read_text().strip() if version_file.exists() else "idk (file not found)"
         await self.send(build("PRIVMSG", [target, version]))
-
-    async def _handle_extra(self, target):
-        if not self.extra_api:
+    
+    async def _handle_extra(self, target, cmd):
+        config = self.extra_commands.get(cmd)
+        if not config or not config["api"]:
             return
+        
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(self.extra_api) as resp:
+                async with session.get(config["api"]) as resp:
                     if resp.status != 200:
                         return
                     data = await resp.json()
-                    result = eval(self.extra_transform, {"__builtins__": {"float": float, "int": int, "str": str}}, {"data": data}) if self.extra_transform else data
-                    await self.send(build("PRIVMSG", [target, result]))
+                    
+                    if config["transform"]:
+                        result = eval(
+                            config["transform"],
+                            {"__builtins__": {"float": float, "int": int, "str": str}},
+                            {"data": data}
+                        )
+                    else:
+                        result = data
+                    
+                    await self.send(build("PRIVMSG", [target, str(result)]))
         except:
             pass
-
+    
     async def line_send(self, line: Line):
         print(f"{self.name} > {line.format()}")
-
 
 class Bot(BaseBot):
     def create_server(self, name: str) -> Server:
         return Server(self, name)
-
 
 async def _main():
     bot = Bot()
