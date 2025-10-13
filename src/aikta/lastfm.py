@@ -126,7 +126,7 @@ class LastFM:
     async def now_playing_for_users(self, users):
         """Get formatted tracks for multiple users (playing or recent)."""
         tasks = [
-            self.get_now_playing(user_id=user["id"], nick=user.get("display_name"))
+            self.get_now_playing(user_id=user["id"])
             for user in users
         ]
 
