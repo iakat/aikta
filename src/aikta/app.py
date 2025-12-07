@@ -2,7 +2,7 @@ from ircrobots import Bot as BaseBot, Server as BaseServer, ConnectionParams
 from irctokens import build, Line
 from aikta.sqlite import Storage
 from aikta.settings import SERVER, PORT, NICK, LASTFM_API_KEY, CHANNELS, DATA_DIR
-from aikta.lastfm import LastFM
+from aikta.music import MusicClient
 import asyncio
 import aiohttp
 import os
@@ -12,8 +12,8 @@ class Server(BaseServer):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.storage = Storage(db=Path(DATA_DIR) / "aikta.db")
-        self.lastfm = LastFM(LASTFM_API_KEY, self.storage)
-        
+        self.lastfm = MusicClient(LASTFM_API_KEY, self.storage)
+
         # Parse multiple extra commands
         self.extra_commands = {}
         extra_config = os.getenv("EXTRA_COMMANDS", "")
@@ -25,7 +25,7 @@ class Server(BaseServer):
                     api = parts[1].strip()
                     transform = parts[2].strip() if len(parts) > 2 else ""
                     self.extra_commands[cmd] = {"api": api, "transform": transform}
-    
+
     async def line_read(self, line: Line):
         print(f"{self.name} < {line.format()}")
         match line.command:
@@ -37,51 +37,72 @@ class Server(BaseServer):
                 target, msg = line.params[:2]
                 nick = line.source.split("!")[0]
                 cmd = msg.split()[0].lower()
-                
+
                 match cmd:
                     case ".np": await self._handle_np(target, nick, msg)
                     case ".wp": await self._handle_wp(target)
                     case ".v": await self._handle_version(target)
                     case _ if cmd in self.extra_commands:
                         await self._handle_extra(target, cmd)
-    
+
+    async def _handle_song(self, nick):
+        service, username = await asyncio.gather(
+            self.storage.read(f"music:{nick}"),
+            self.storage.read(f"music_username:{nick}")
+        )
+        if not service or not username:
+            return f"{nick}: no music service set."
+
+        data = await self.music_client.get_now_playing(service=service, username=username, nick=nick)
+        return data["formatted"] if data and data.get("song", {}).get("artist") else f"{nick}: no recent track found."
+
     async def _handle_np(self, target, nick, msg):
-        args = msg.split()[1:]
-        lfm_user = args[0] if args else await self.storage.read(f"lastfm:{nick}")
-        if args:
-            await self.storage.write(f"lastfm:{nick}", lfm_user)
-        if not lfm_user:
-            return await self.send(build("PRIVMSG", [target, f"{nick}: set your lastfm: .np username"]))
-        data = await self.lastfm.get_now_playing(lfm=lfm_user, nick=nick)
-        resp = data["formatted"] if data and data["song"]["artist"] else f"{nick}: No recent track found."
-        await self.send(build("PRIVMSG", [target, resp]))
-    
+        parts = msg.split()
+        if len(parts) > 1:
+            prefixes = {"fm:": "lastfm", "lb:": "listenbrainz"}
+            arg = parts[1].lower()
+
+            try:
+                service = next(s for p, s in prefixes.items() if arg.startswith(p))
+                username = parts[2] if len(parts) > 2 else None
+                if not username:
+                    return await self.send(build("PRIVMSG", [target, f"{nick}: Usage: .np [fm:|lb:]<username>"]))
+                await asyncio.gather(
+                    self.storage.write(f"music:{nick}", service),
+                    self.storage.write(f"music_username:{nick}", username)
+                )
+            except StopIteration:
+                return await self.send(build("PRIVMSG", [target, f"{nick}: pls use 'fm:' or 'lb:'"]))
+
+        await self.send(build("PRIVMSG", [target, await self._handle_song(nick)]))
+
     async def _handle_wp(self, target):
         if not (channel := self.channels.get(target)):
             return
-        users = [{"id": n, "display_name": n} for n in channel.users]
-        results = await self.lastfm.now_playing_for_users(users)
-        for result in results or ["..."]:
-            await self.send(build("PRIVMSG", [target, result]))
-            await asyncio.sleep(1.0)
-    
+
+        tasks = [self._handle_song(nick) for nick in channel.users]
+        for result in await asyncio.gather(*tasks):
+            if "no music service set" not in result and "No recent track found" not in result:
+                await self.send(build("PRIVMSG", [target, result]))
+                await asyncio.sleep(0.5)
+
     async def _handle_version(self, target):
         version_file = Path("/app/.venv/.git_commit")
         version = version_file.read_text().strip() if version_file.exists() else "idk (file not found)"
         await self.send(build("PRIVMSG", [target, version]))
-    
+
     async def _handle_extra(self, target, cmd):
         config = self.extra_commands.get(cmd)
         if not config or not config["api"]:
             return
-        
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(config["api"]) as resp:
                     if resp.status != 200:
                         return
                     data = await resp.json()
-                    
+
                     if config["transform"]:
                         result = eval(
                             config["transform"],
@@ -90,11 +111,11 @@ class Server(BaseServer):
                         )
                     else:
                         result = data
-                    
+
                     await self.send(build("PRIVMSG", [target, str(result)]))
         except:
             pass
-    
+
     async def line_send(self, line: Line):
         print(f"{self.name} > {line.format()}")
 
