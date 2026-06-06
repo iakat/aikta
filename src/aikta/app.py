@@ -59,7 +59,7 @@ class Server(BaseServer):
     async def _handle_wp(self, target):
         if not (channel := self.channels.get(target)):
             return
-        users = [{"id": n, "display_name": n} for n in channel.users]
+        users = list(set([{"id": n, "display_name": n} for n in channel.users]))
         results = await self.lastfm.now_playing_for_users(users)
         for result in results or ["..."]:
             await self.send(build("PRIVMSG", [target, result]))
